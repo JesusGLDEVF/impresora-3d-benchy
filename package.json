@@ -1,0 +1,16 @@
+{
+  "name": "impresora-3d-benchy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Figura isométrica interactiva de una impresora 3D imprimiendo un Benchy capa a capa.",
+  "homepage": "https://jesusgldevf.github.io/impresora-3d-benchy/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JesusGLDEVF/impresora-3d-benchy.git"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node tools/check.js"
+  },
+  "license": "MIT"
+}

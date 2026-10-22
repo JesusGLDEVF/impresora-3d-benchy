@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Impresora 3D</title><style>#fig .tag path{stroke-width:.45}</style></head><body>
+<script src="core.js"></script>
+<script>
+/* Impresora 3D (bedslinger) que imprime un Benchy.
+   Ejes del motor: x = fondo (la cara frontal está en x = W), y = ancho (+y a la izquierda), z = arriba.
+   La cama se desliza en x (eje Y de la impresora), el carro en y (eje X) y el pórtico sube en z (eje Z).
+   El filamento va de la bobina al extrusor, por el tubo PTFE, hasta el hotend. */
+const W = 48, D = 46, H = 70;
+const BED_TOP = 13.1, BENCHY_H = 14.1, LAYER = .45;
+const PRINT_GZ0 = 24.2, PARK_GZ = 38.2, NOZ = 10.7;
+const CAB_Z = 10.3, ROOF_Z = 10.9, CHIM_Z = 14.1;
+
+const FRD   = matOf('#33383b');   // plástico oscuro / carro
+const SIL   = matOf('#b9c0c4');   // aluminio
+const SIL2  = matOf('#939a9e');
+const RUB   = matOf('#292c2e');   // goma / correas
+const BRASS = matOf('#c9a03f');
+const CU    = matOf('#bd7a46');
+const PCB   = matOf('#3d7b56');
+const PEI   = matOf('#4a4e50');
+const CREAM = matOf('#e9e3d5');
+const BLUE  = matOf('#406fae');
+const PROBE = matOf('#3b679b');
+const BEDM  = matOf('#5a413a');
+
+const FILS = [
+  { name:'Tomate',  key:'tomato'  },
+  { name:'Mostaza', key:'mustard' },
+  { name:'Menta',   key:'mint'    },
+  { name:'Cobalto', key:'cobalt'  },
+  { name:'Rubor',   key:'blush'   },
+];
+const filCol = i => PALS[FILS[((i % FILS.length) + FILS.length) % FILS.length].key];
+
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const lerp = (a,b,t) => a + (b - a)*t;
+const smooth = (a,b,x) => { const t = clamp((x-a)/(b-a),0,1); return t*t*(3-2*t); };
+const B = (x0,y0,z0,x1,y1,z1) => [[x0,y0,z0],[x1,y1,z1]];
+const scaleUV = (pts,s,cx=0,cy=0) => pts.map(([x,y]) => [cx+(x-cx)*s, cy+(y-cy)*s]);
+const cap3d = (pts,col,w=.6) => fill(pd(pts),col) + ink(pd(pts),w);
+// ink only the half of a ring that faces the viewer, so hidden edges don't show through
+function ringLine(ring, w=.45){
+  if (!ring.length) return '';
+  const c = avg(ring); let d = '';
+  for (let i=0;i<ring.length;i++){
+    const a = ring[i], b = ring[(i+1)%ring.length];
+    const m = [(a[0]+b[0])/2,(a[1]+b[1])/2,(a[2]+b[2])/2];
+    if (!vis([m[0]-c[0], m[1]-c[1], m[2]-c[2]])) continue;
+    const pa = P(a[0],a[1],a[2]), pb = P(b[0],b[1],b[2]);
+    d += `M${f(pa[0])} ${f(pa[1])}L${f(pb[0])} ${f(pb[1])}`;
+  }
+  return d ? ink(d, w) : '';
+}
+
+/* ---------- el Benchy ----------
+   Silueta de casco convexa (proa en +x, popa plana), caseta y chimenea. Se dibuja por capas:
+   sólo existe lo que ya se ha impreso, y la capa en curso lleva una tapa clara. */
+const O = [[-7.0,-3.3],[-2.0,-3.9],[1.5,-3.7],[3.6,-3.0],[5.4,-1.8],[8.0,0],
+           [5.4,1.8],[3.6,3.0],[1.5,3.7],[-2.0,3.9],[-7.0,3.3],[-7.4,2.4],[-7.4,-2.4]];
+const HS = [[0,.46],[.6,.68],[1.5,.9],[2.7,1],[4.6,1],[6.3,.94]];
+const hS = z => { for (let i=1;i<HS.length;i++){ if (z <= HS[i][0]){ const [z0,s0]=HS[i-1], [z1,s1]=HS[i]; return s0+(s1-s0)*(z-z0)/(z1-z0); } } return .94; };
+const CAB = rrUV(-5.0,-1.95,-.2,1.95,.7,5);          // caseta
+const ROOF = scaleUV(CAB,1.12,-2.6,0);                // alero del techo
+const hullRingUV = z => scaleUV(O, hS(z));
+
+function benchySvg(bx,by,bz,printed,BF,Fresh,printing){
+  if (printed <= .02) return '';
+  const F = matOf(BF.l);
+  const p = Math.min(printed, BENCHY_H);
+  const off = (uv,z) => uv.map(([x,y]) => [bx+x, by+y, bz+z]);
+  const sideLine = (uv,z,w=.45) => ringLine(off(uv,z), w);
+  let s = '';
+  s += cap3d(off(scaleUV(O,hS(0)), .004), F.d, .8);         // fondo
+  // casco por capas
+  let lastH = 0;
+  for (let z=0; z<6.3-1e-6; z+=LAYER){
+    const z1 = Math.min(6.3, z+LAYER);
+    if (z1 > p+1e-6) break;
+    s += loft(off(scaleUV(O,hS(z)),z), off(scaleUV(O,hS(z1)),z1), n=>tone(n,F));
+    s += sideLine(scaleUV(O,hS(z1)), z1, .42);
+    lastH = z1;
+  }
+  if (p < 6.3 && p > lastH+.02){                            // capa en curso
+    s += loft(off(scaleUV(O,hS(lastH)),lastH), off(scaleUV(O,hS(p)),p), n=>tone(n,F));
+    s += cap3d(off(scaleUV(O,hS(p)),p), Fresh.l, .5);
+    s += sideLine(scaleUV(O,hS(p)), p, .5);
+  }
+  // cubierta
+  if (p >= 6.3-1e-6){
+    s += cap3d(off(scaleUV(O,hS(6.3)),6.32), F.m, .9);
+    s += sideLine(scaleUV(O,.8), 6.36, .35);
+  }
+  // caseta por capas
+  let lastC = 6.3;
+  if (p > 6.3){
+    for (let z=6.3; z<CAB_Z-1e-6; z+=.4){
+      const z1 = Math.min(CAB_Z, z+.4);
+      if (z1 > p+1e-6) break;
+      s += loft(off(CAB,z), off(CAB,z1), n=>tone(n,F));
+      s += sideLine(CAB,z1,.4);
+      lastC = z1;
+    }
+    if (p < CAB_Z && p > lastC+.02){
+      s += loft(off(CAB,lastC), off(CAB,p), n=>tone(n,F));
+      s += cap3d(off(CAB,p), Fresh.l, .5);
+      s += sideLine(CAB,p,.5);
+    }
+    if (p >= CAB_Z-1e-6 && p < ROOF_Z-.02) s += cap3d(off(CAB,CAB_Z), Fresh.l, .6);
+  }
+  // techo
+  if (p >= ROOF_Z-.02){
+    s += loft(off(CAB,CAB_Z), off(ROOF,ROOF_Z), n=>tone(n,F));
+    s += cap3d(off(ROOF,ROOF_Z), F.m, .8);
+    s += sideLine(ROOF, ROOF_Z-.03, .4);
+  }
+  // chimenea (crece como una capa más)
+  if (p > ROOF_Z+.05){
+    const z1 = Math.min(CHIM_Z, p);
+    s += rod([bx-3.6,by+.7,bz+ROOF_Z], [bx-3.6,by+.7,bz+z1], .52, F, tone, .8, .52, 14);
+    if (p >= CHIM_Z-.05){
+      const rr = on(PZ(bz+CHIM_Z+.01), ellUV(bx-3.6,by+.7,.30,.30,12));
+      s += fill(pd(rr), '#2a2019') + ink(pd(rr), .5);
+    }
+  }
+  // ventanas
+  if (p >= 9.65){
+    const WIN = '#2a3a3c';
+    if (facing([0,1,0])){
+      s += shape(on(PY(by+1.98), rrUV(bx-4.35, bz+8.05, bx-2.95, bz+9.45, .18,4)), WIN, .5);
+      s += shape(on(PY(by+1.98), rrUV(bx-2.55, bz+8.05, bx-.95,  bz+9.45, .18,4)), WIN, .5);
+    }
+    if (facing([0,-1,0])){
+      s += shape(on(PY(by-1.98), rrUV(bx-4.35, bz+8.05, bx-2.95, bz+9.45, .18,4)), WIN, .5);
+      s += shape(on(PY(by-1.98), rrUV(bx-2.55, bz+8.05, bx-.95,  bz+9.45, .18,4)), WIN, .5);
+    }
+    if (facing([1,0,0]))  s += shape(on(PX(bx-.17), rrUV(by-1.3,  bz+8.0, by+1.3,  bz+9.6, .35,5)), WIN, .5);
+    if (facing([-1,0,0])) s += shape(on(PX(bx-5.03), rrUV(by-1.1, bz+8.2, by+1.1, bz+9.5, .3,4)), WIN, .5);
+  }
+  // siluetas entintadas
+  const hp = [];
+  for (let z=0; z<Math.min(p,6.3); z+=LAYER) hp.push(...off(hullRingUV(z), z));
+  hp.push(...off(hullRingUV(Math.min(p,6.3)), Math.min(p,6.3)));
+  if (p >= 6.3) hp.push(...off(hullRingUV(6.3), 6.32));
+  s += hullInk(hp, 1.5);
+  if (p > 6.3){
+    const cp = [];
+    for (let z=6.3; z<Math.min(p,CAB_Z); z+=.4) cp.push(...off(CAB,z));
+    if (p < CAB_Z) cp.push(...off(CAB,p)); else cp.push(...off(CAB,CAB_Z));
+    if (p >= ROOF_Z) cp.push(...off(ROOF,ROOF_Z));
+    s += hullInk(cp, 1.2);
+  }
+  return s;
+}
+function scene(st, m){
+  const phase = st.phase || 'ready';
+  const k = ease(st.xr || 0);
+  const hot = phase === 'printing', heating = phase === 'heating';
+  const active = hot || phase === 'done';
+  const prog = clamp(st.progress || 0, 0, 1);
+  const printed = st.printed || 0;
+  const BF = filCol(st.benchFil ?? st.fil ?? 0);
+  const F  = filCol(st.fil ?? 0);
+  const FM = matOf(F.l);
+  const Fresh = matOf(mix(BF.l, '#ffffff', .18));
+  const layerN = printed / LAYER;
+  const startK = smooth(0,.035,prog), endK = smooth(.93,1,prog);
+  const bedPrint = 18 + 4*Math.sin(layerN*2.1);
+  const cyPrint  = 23 + 3.2*Math.sin(layerN*3.7 + .6);
+  const bedX = active ? lerp(30, lerp(bedPrint, 30, endK), startK) : 30;
+  const cy   = active ? lerp(23, lerp(cyPrint, 23, endK), startK) : 23;
+  const gz   = active ? lerp(PARK_GZ, lerp(PRINT_GZ0 + printed, PARK_GZ, endK), startK) : PARK_GZ;
+  const heatK = clamp((st.nozzle - 60)/150, 0, 1);
+  const HMAT = matOf(mix('#bd7a46', '#ff5f2a', heatK));
+  const mShell = matOf(mix(m.m, '#ffffff', .04)); // carcasa fantasma: tinte propio para que el post-proceso no la opaque
+  const buckets = { base:[], frame:[], chassis:[], bed:[], gantry:[], spool:[], inner:[] };
+  let into = buckets.base;
+  const put = (b, svg) => { if (svg) into.push({ box:b, at:boxMid(b), svg }); };
+  const ghost = s => k > .02 ? `<g style="opacity:${f(1-.66*k)}">${s}</g>` : s;
+  const putS = (b, svg) => put(b, ghost(svg));
+
+  const shadow = castShadow([[1,1,0],[44,1,0],[44,43,0],[1,43,0],[18,23,66],[18,23,48]], 0);
+  let out = k > .02 ? `<g style="opacity:${f(1-.65*k)}">${shadow}</g>` : shadow; // en rayos X la sombra no tapa las tripas
+
+  /* ---------- carcasa ---------- */
+  for (const [fx,fy] of [[6,6],[42,6],[6,40],[42,40]])
+    putS(B(fx-1.4,fy-1.4,0,fx+1.4,fy+1.4,1.6), cyl(fx,fy,0,1.6,1.4,RUB,toneI,1.0,14));
+  let base = box(2,2,1.6,44,44,8,mShell,tone,1.1);
+  base += line(on(PX(44.02), [[5,7.2],[42,7.2]]), .45);
+  base += tx(44.42, 35, 5.9, 'CF·01', 2.2, '#efe7d6', 800);
+  base += box(44.01,24,3.1,44.35,42.6,4.0,matOf(m.l),tone,.6);
+  putS(B(2,2,1.6,44,44,8), base);
+  into = buckets.frame;
+  const upright = (y0,y1) => {
+    let s = box(5,y0,8,9,y1,48,mShell,tone,1.0);
+    s += line(on(PX(9.02), [[y0+1.4,9.5],[y0+1.4,47]]), .35);
+    s += line(on(PX(9.02), [[y1-1.4,9.5],[y1-1.4,47]]), .35);
+    return s;
+  };
+  putS(B(5,4,8,9,8,48), upright(4,8));
+  putS(B(5,38,8,9,42,48), upright(38,42));
+  let top = box(5,4,44,9,42,48,mShell,tone,1.0);
+  top += line(on(PX(9.02), [[6,45.4],[40,45.4]]), .35);
+  top += line(on(PX(9.02), [[6,46.6],[40,46.6]]), .35);
+  putS(B(5,4,44,9,42,48), top);
+
+  /* consola LCD (siempre sólida) */
+  let lcd = box(44,8,2,46.8,22,8.6,FRD,tone,1.0);
+  lcd += shape(on(PX(46.83), rrUV(9.3,3.2,19.2,7.7,.5)), '#1e3a32', .7);
+  const stTxt = { ready:'LISTO', heating:'CALENT.', printing:'IMPRIME', done:'FINAL', cooling:'ENFRÍA' }[phase] || 'LISTO';
+  lcd += tx(46.95, 14.2, 6.35, stTxt, 1.9, '#f4bb45', 800);
+  lcd += tx(46.95, 14.2, 4.55, `${Math.round(st.nozzle)}° / ${Math.round(st.bed)}°`, 1.45, '#f4bb45', 700);
+  lcd += fill(pd(on(PX(46.9), rectUV(9.8,3.42,18.7,3.78))), '#0f201c');
+  if (prog > .02) lcd += fill(pd(on(PX(46.91), rectUV(9.8,3.42,9.8+8.9*prog,3.78))), m.l);
+  lcd += ink(pd(on(PX(46.92), rectUV(9.8,3.42,18.7,3.78))), .35);
+  lcd += line(on(PX(46.84), [[9.4,8.05],[11.6,8.05]]), .8);
+  lcd += cylX(46.8,47.9,20.5,5,1.15,FRD,toneI,1.0,16);
+  lcd += line(on(PX(47.92), [[20.5,6.35],[20.5,5.9]]), .6);
+  put(B(44,8,2,47.95,22,8.6), lcd);
+
+  /* interruptor de red, en el costado */
+  let psw = box(36,44,3,40,45.4,5.6,FRD,tone,1.0);
+  psw += box(37,45.4,3.6,39,45.7,5.0,m,tone,.7);
+  put(B(36,44,3,40,45.7,5.6), psw);
+
+  /* ---------- bobina y filamento ---------- */
+  into = buckets.spool;
+  const spoolSvg = (() => {
+    let s = '';
+    s += box(9.6,20.6,48,13.4,25.4,49.3,FRD,toneI,.8);
+    s += rod([11.5,23,49],[11.5,23,58],.7,FRD,toneI,.9);
+    s += rod([11.5,23,58],[23.4,23,58],.35,SIL,toneI,.8);
+    s += rod([14.4,23,58],[20.6,23,58],8.3,FM,tone,1.2,8.3,28);
+    for (const x of [15.4,16.6,17.9,19.1,20.1]) s += ringLine(on(PX(x), ellUV(23,58,8.31,8.31,24)), .32);
+    const FLG = matOf('#c9a86a');
+    s += rod([13.4,23,58],[14.5,23,58],9.7,FLG,tone,1.1,9.7,30);
+    const face = fx => {
+      const c = on(PX(fx), ellUV(23,58,6.2,6.2,24));
+      let q = fill(pd(c), FM.l) + ink(pd(c), .45);
+      for (const rr of [5.2,4.2,3.2]) q += ringLine(on(PX(fx), ellUV(23,58,rr,rr,20)), .22);
+      return q;
+    };
+    s += face(13.38);
+    s += rod([20.6,23,58],[21.7,23,58],9.7,FLG,tone,1.1,9.7,30);
+    s += face(21.72);
+    s += rod([21.7,23,58],[22.6,23,58],2.0,FRD,toneI,.8,2.0,18);
+    s += tx(21.78, 23, 61.8, 'PLA', 2.0, INK, 800);
+    return act('spool', s);
+  })();
+  put(B(9.5,13,48,23.4,33,68), spoolSvg);
+  const strandPts = [[19.5,23.6,66.2],[23,26,65],[23.5,30,60],[16,33,54],[11.3,34.5,50.6],[11.5,34.7,gz+7.7]];
+  let strand = '';
+  for (let i=0;i<strandPts.length-1;i++) strand += rod(strandPts[i], strandPts[i+1], .22, FM, toneI, .35, .22, 10);
+  put(B(10.8,22,49,23.8,34,67.5), strand);
+
+  /* ---------- pórtico X ---------- */
+  into = buckets.gantry;
+  let beam = box(7.5,7.5,gz,11.5,38.5,gz+4,FRD,tone,1.1);
+  beam += line(on(PX(11.52), [[8,gz+.9],[38,gz+.9]]), .5);
+  put(B(7.5,7.5,gz,11.5,38.5,gz+4), beam);
+  put(B(6.6,6.8,gz-1,12.2,10,gz+4.6), box(6.6,6.8,gz-1,12.2,10,gz+4.6,FRD,tone,1.0));
+  put(B(6.6,36,gz-1,12.2,39.2,gz+4.6), box(6.6,36,gz-1,12.2,39.2,gz+4.6,FRD,tone,1.0));
+  put(B(11.2,8,gz+.7,11.9,38,gz+1.3), rod([11.55,8,gz+1],[11.55,38,gz+1],.3,SIL,toneI,.7));
+  put(B(11.45,8,gz+3.2,11.85,38,gz+3.9), box(11.45,8,gz+3.25,11.85,38,gz+3.85,RUB,toneI,.5));
+  put(B(10.9,37.4,gz+2.6,12.3,38.7,gz+3.9), rod([11.1,38.2,gz+3.25],[12.1,38.2,gz+3.25],.6,SIL,toneI,.6));
+  let xm = box(9.2,38.6,gz-.2,13.2,42.4,gz+3.8,FRD,tone,1.0);
+  xm += rod([13.2,39.7,gz+1.8],[14.2,39.7,gz+1.8],.8,SIL,toneI,.8);
+  put(B(9.2,38.4,gz-.4,14.2,42.4,gz+3.8), xm);
+  let car = box(11.8,cy-4,gz-2,18.8,cy+4,gz+2.4,FRD,tone,1.0);
+  car += box(12.2,cy-2.2,gz+2.4,17.6,cy+2.2,gz+3.0,FRD,toneI,.7);
+  put(B(11.8,cy-4,gz-2,18.8,cy+4,gz+3.0), car);
+
+  /* extrusor, tubo PTFE y hotend */
+  let ex = box(9.5,33,gz+4.05,13.5,36.5,gz+7.0,FRD,tone,1.0);
+  ex += rod([13.5,34.8,gz+5.5],[14.3,34.8,gz+5.5],1.25,SIL,toneI,.9);
+  ex += cyl(11.5,34.7,gz+7.0,gz+7.7,.55,BLUE,toneI,.8);
+  put(B(9.5,33,gz+4.05,14.3,36.5,gz+7.7), ex);
+  const bow = [[11.5,34.7,gz+7.8],[11.7,28.5,gz+9.2],[13.2,23.8,gz+8.8],[16.4,cy+1.2,gz+4.2],[18,cy,gz+.4],[18,cy,gz-1.5]];
+  let tube = '';
+  for (let i=0;i<bow.length-1;i++) tube += rod(bow[i],bow[i+1],.42,CREAM,toneI,.7,.42,12);
+  tube += cyl(18,cy,gz-1.9,gz-1.1,.62,BLUE,toneI,.7);
+  put(B(10.8,22,gz-2.2,19,35.2,gz+9.8), tube);
+  put(B(16.5,cy-1.5,gz-7.4,19.5,cy+1.5,gz-1.9), cyl(18,cy,gz-7.4,gz-1.9,1.5,SIL,toneI,1.0,18));
+  for (const zf of [gz-6.8,gz-5.95,gz-5.1,gz-4.25,gz-3.4])
+    put(B(16.1,cy-1.95,zf,19.9,cy+1.95,zf+.32), cyl(18,cy,zf,zf+.32,1.95,SIL2,toneI,.55,18));
+  put(B(16.2,cy-1.8,gz-9.2,19.8,cy+1.8,gz-7.4), box(16.2,cy-1.8,gz-9.2,19.8,cy+1.8,gz-7.4,HMAT,toneI,.9));
+  put(B(16.9,cy-.9,gz-10.8,19.1,cy+.9,gz-9.2), rod([18,cy,gz-9.2],[18,cy,gz-10.8],.95,BRASS,toneI,.85,.3,14));
+  put(B(15.4,cy-.4,gz-8.6,20.6,cy+.4,gz-7.8), rod([15.4,cy,gz-8.2],[20.6,cy,gz-8.2],.38,matOf('#a33a2c'),toneI,.5));
+  let pf = box(16.2,cy+4.0,gz-7.2,19.8,cy+6.6,gz-3.6,FRD,tone,1.0);
+  pf += box(16.6,cy+3.6,gz-7.6,19.4,cy+4.2,gz-3.6,matOf(m.l),tone,.7);
+  if (facing([0,1,0])){
+    pf += shape(on(PY(cy+6.63), ellUV(18,gz-5.4,1.55,1.55,16)), '#2b2f32', .6);
+    pf += ink(pd(on(PY(cy+6.66), ellUV(18,gz-5.4,.42,.42,10))), .5);
+    pf += line(on(PY(cy+6.65), [[16.6,gz-5.4],[19.4,gz-5.4]]), .4);
+    pf += line(on(PY(cy+6.65), [[18,gz-6.8],[18,gz-4.0]]), .4);
+  }
+  put(B(16.2,cy+3.6,gz-7.6,19.8,cy+6.6,gz-3.4), pf);
+  let hf = box(19.9,cy-2.2,gz-5.3,21.1,cy+2.2,gz-1.5,FRD,tone,1.0);
+  if (facing([1,0,0])){
+    hf += shape(on(PX(21.13), ellUV(cy,gz-3.4,1.5,1.5,16)), '#2b2f32', .6);
+    hf += ink(pd(on(PX(21.16), ellUV(cy,gz-3.4,.4,.4,10))), .5);
+    hf += line(on(PX(21.15), [[cy-1.5,gz-3.4],[cy+1.5,gz-3.4]]), .4);
+  }
+  put(B(19.9,cy-2.2,gz-5.3,21.1,cy+2.2,gz-1.5), hf);
+  put(B(19.1,cy-3.7,gz-7.4,20.5,cy-2.4,gz-5.4),
+      box(19.1,cy-3.7,gz-6.6,20.5,cy-2.4,gz-5.4,PROBE,tone,.8)
+      + rod([19.8,cy-3.05,gz-5.4],[19.8,cy-3.05,gz-7.2],.12,SIL,toneI,.4));
+  if (hot){
+    const gp = P(18,cy,gz-NOZ+.15);
+    put(B(17.4,cy-.6,gz-NOZ-.1,18.6,cy+.6,gz-NOZ+.4),
+        `<circle cx="${f(gp[0])}" cy="${f(gp[1])}" r="1.1" fill="#ff8a3c" opacity=".85"/>`);
+  }
+
+  /* ---------- eje Z ---------- */
+  into = buckets.frame;
+  let zs = rod([11.4,40.4,12.2],[11.4,40.4,46],.6,BRASS,toneI,1.0);
+  for (let z=14.6; z<45.6; z+=2.6) zs += ringLine(on(PZ(z), ellUV(11.4,40.4,.62,.62,12)), .3);
+  put(B(10.8,39.8,12.2,12,41,46), zs);
+  let zm = box(9.4,38.2,8,13.4,42.2,12.2,FRD,tone,1.0);
+  zm += cyl(11.4,40.4,12.2,12.9,.85,SIL,toneI,.7);
+  put(B(9.4,38.2,8,13.4,42.2,12.2), zm);
+  put(B(8.8,39.8,46,13.4,42.4,47.6), box(8.8,39.8,46,13.4,42.4,47.6,mShell,tone,.8));
+  into = buckets.gantry;
+  put(B(9.4,38,gz+1,12.6,41.6,gz+2.6),
+      box(9.4,38,gz+1,12.6,41.6,gz+2.6,m,tone,.8)
+      + box(10.2,39.2,gz+1.02,12.6,41.6,gz+2.58,BRASS,toneI,.8));
+
+  /* ---------- cama Y ---------- */
+  into = buckets.chassis;
+  put(B(7,20.5,8,42,25.5,9.5), box(7,20.5,8,42,25.5,9.5,SIL2,toneI,1.0));
+  put(B(7,22.4,9.45,42,23.3,9.78), box(7,22.4,9.45,42,23.3,9.78,RUB,toneI,.5));
+  let ym = box(3,19.8,8,7,23.8,12.1,FRD,tone,1.0);
+  ym += cyl(6.4,21.8,9.4,11.6,.9,SIL,toneI,.8);
+  put(B(3,19.8,8,7,23.8,12.1), ym);
+  put(B(8.2,26.4,8,10,27.8,9.4), box(8.2,26.4,8,9.8,27.8,9.3,FRD,toneI,.7)
+      + line([[8.4,26.6,9.3],[9.3,27.2,9.3],[9.6,27.6,9.3]], .7));
+  into = buckets.bed;
+  const bx = bedX;
+  put(B(bx-10.5,12,9.75,bx+10.5,34,10.7), box(bx-10.5,12,9.75,bx+10.5,34,10.7,FRD,tone,1.0));
+  for (const sx of [bx-9.5,bx+9.5]) for (const sy of [13.4,32.6]){
+    let sp = cyl(sx,sy,10.7,12.2,.55,BRASS,toneI,.7,10);
+    for (const z of [10.95,11.35,11.75]) sp += ringLine(on(PZ(z), ellUV(sx,sy,.58,.58,10)), .3);
+    put(B(sx-.6,sy-.6,10.7,sx+.6,sy+.6,12.2), sp);
+  }
+  put(B(bx-12,11,12.2,bx+12,35,12.8), box(bx-12,11,12.2,bx+12,35,12.8,BEDM,toneI,1.0));
+  put(B(bx-11.5,11.5,12.8,bx+11.5,34.5,13.1), box(bx-11.5,11.5,12.8,bx+11.5,34.5,13.1,PEI,tone,1.0));
+  put(B(bx+11.8,22,12.2,bx+13.2,24,12.9), box(bx+11.8,22,12.2,bx+13.2,24,12.9,matOf(m.l),tone,.7));
+  if (st.benchy && printed > .02){
+    const bs = benchySvg(bx, 23, BED_TOP, printed, BF, Fresh, hot);
+    put(B(bx-7.6, 23-4.0, BED_TOP, bx+8.1, 23+4.0, BED_TOP+Math.min(printed,BENCHY_H)+.05), act('benchy', bs));
+  }
+
+  /* ---------- dentro de la base (sólo con la carcasa fantasma) ---------- */
+  if (k > .02){
+    into = buckets.inner;
+    put(B(4.5,27,1.9,16.5,41.5,7.4), box(4.5,27,1.9,16.5,41.5,7.4,FRD,toneI,1.0));
+    let mb = box(21.5,4.5,1.9,40.5,23,2.7,PCB,toneI,1.0);
+    mb += box(23,6,2.7,27.5,10.5,3.5,FRD,toneI,.6);
+    mb += box(29,6,2.7,32,8.5,3.25,FRD,toneI,.5);
+    mb += box(32.8,6,2.7,35.8,8.5,3.25,FRD,toneI,.5);
+    mb += box(29,13,2.7,32,15.5,3.25,FRD,toneI,.5);
+    mb += cyl(36.5,11,2.7,5.4,.8,SIL,toneI,.5,12);
+    mb += cyl(38.6,14.2,2.7,5.0,.8,SIL,toneI,.5,12);
+    mb += box(22,17,2.7,24.5,21.5,4.1,matOf('#2d6a4a'),toneI,.5);
+    mb += box(34,17,2.7,39,21,3.6,matOf('#2d6a4a'),toneI,.5);
+    put(B(21.5,4.5,1.9,40.5,23,5.4), mb);
+    const wire = (pts,col) => pts.slice(0,-1).map((p,i) => rod(p,pts[i+1],.15,matOf(col),toneI,.35,.15,8)).join('');
+    let wr = '';
+    wr += wire([[24,21,2.6],[19,25,2.6],[16.6,29,2.6]], '#b8442e');
+    wr += wire([[25,18,2.6],[20,20,4],[16.6,32,4]], '#2b2b2b');
+    wr += wire([[30,5,2.6],[20,10,2.6],[13,30,2.6]], '#c9a03f');
+    wr += wire([[34,20,2.6],[30,26,2.6],[13,34,2.6]], '#406fae');
+    put(B(12,4,2,40.5,40,6), wr);
+  }
+  const joinB = arr => arr.map(p => p.svg).join('');
+  const outer = [];
+  outer.push({ box:B(.6,.6,0,44,44,8), at:[22,22,4], svg:joinB(buckets.base) });
+  outer.push({ box:B(3,19.8,8,42,27.8,12.1), at:[22.5,23.5,10], svg:joinB(buckets.chassis) });
+  outer.push({ box:B(bedX-12,11,9.75,bedX+13.2,35,BED_TOP+Math.max(printed,.4)+.1), at:[bedX,23,12.4], svg:joinB(buckets.bed) });
+  outer.push({ box:B(6.6,6.8,gz-10.8,21.5,42.4,gz+9.8), at:[14,24,gz], svg:joinB(buckets.gantry) });
+  outer.push({ box:B(9.5,13,48,23.8,35,68), at:[17,24,58], svg:joinB(buckets.spool) });
+  for (const p of buckets.frame) outer.push(p);
+  if (k > .02) out += `<g opacity="${f(k)}">${joinB(buckets.inner)}</g>`;
+  out += byDepth(outer);
+  if (k > .6){
+    out += xrCallouts([
+      { at:[18,23,64], text:'BOBINA' },
+      { at:[15,30,56], text:'FILAMENTO', on: hot },
+      { at:[13,cy+1,gz+6], text:'TUBO PTFE', on: hot },
+      { at:[10.5,34.8,gz+3], text:'EXTRUSOR' },
+      { at:[9.5,17,gz+2], text:'PÓRTICO X', on: hot },
+      { at:[18,cy,gz-5], text:'HOTEND', on: hot },
+      { at:[18,cy,gz-9.9], text:'BOQUILLA', on: hot },
+      { at:[17.9,cy+5.3,gz-5.2], text:'VENTILADOR' },
+      { at:[11.4,40.4,33], text:'TORNILLO Z', on: hot },
+      { at:[bedX+10,12,13.1], text:'CAMA', on: heating || hot },
+      { at:[bedX+7,13.5,13.1], text:'LÁMINA PEI' },
+      { at:[bedX+7,30,10.2], text:'CARRO Y', on: hot },
+      { at:[36,22.8,9.2], text:'RAÍL Y' },
+      { at:[31,13,2.7], text:'PLACA BASE' },
+      { at:[10,35,4.8], text:'FUENTE' },
+      { at:[45.6,14,5], text:'PANTALLA' },
+    ], [0, W, 0, D, 0, 70]);
+  }
+  return out;
+}
+
+/* ---------- máquina de estados ---------- */
+function startLoop(st, ui){
+  if (st.loop) return;
+  st.loop = true;
+  ui.animate(dt => {
+    if (st.phase === 'heating'){
+      st.nozzle += (210 - st.nozzle) * Math.min(1, dt*1.5);
+      st.bed += (60 - st.bed) * Math.min(1, dt*1.1);
+      if (st.nozzle > 203 && st.bed > 56){
+        st.nozzle = 210; st.bed = 60;
+        if (st.pendingPrint){
+          st.pendingPrint = false; st.phase = 'printing'; st.t = 0;
+          st.progress = 0; st.printed = 0; st.benchy = true;
+          ui.flash('¡Imprimiendo el Benchy!', 1600);
+          return true;
+        }
+        st.phase = 'ready'; st.loop = false;
+        ui.flash('Listo: 210 °C y 60 °C', 1800);
+        return false;
+      }
+      return true;
+    }
+    if (st.phase === 'printing'){
+      st.t = (st.t || 0) + dt;
+      st.progress = Math.min(1, st.t/16);
+      st.printed = BENCHY_H * st.progress;
+      st.nozzle = 210; st.bed = 60;
+      if (st.progress >= 1){
+        st.phase = 'done'; st.printed = BENCHY_H; st.progress = 1;
+        st.loop = false;
+        ui.flash('Benchy terminado · retíralo de la cama', 2600);
+        return false;
+      }
+      return true;
+    }
+    if (st.phase === 'cooling'){
+      st.nozzle += (22 - st.nozzle) * Math.min(1, dt*.8);
+      st.bed += (22 - st.bed) * Math.min(1, dt*.5);
+      if (st.nozzle < 26 && st.bed < 26){
+        st.nozzle = 22; st.bed = 22; st.phase = 'ready'; st.loop = false;
+        return false;
+      }
+      return true;
+    }
+    st.loop = false;
+    return false;
+  });
+}
+const preheat = (st, ui) => {
+  if (st.phase === 'printing') return ui.flash('Espera a que acabe la impresión');
+  if (st.phase === 'heating') return ui.flash('Ya está calentando');
+  if (st.nozzle > 200 && st.bed > 55) return ui.flash('Ya está a temperatura');
+  st.phase = 'heating'; st.pendingPrint = false;
+  ui.flash('Calentando: 210 °C boquilla · 60 °C cama', 2200);
+  startLoop(st, ui);
+};
+const printBenchy = (st, ui) => {
+  if (st.phase === 'printing') return ui.flash('Ya está imprimiendo');
+  if (st.phase === 'heating') return ui.flash('Calentando…');
+  if (st.phase === 'done' || (st.benchy && st.printed > 0)) return ui.flash('Quita el Benchy de la cama primero');
+  st.benchy = true; st.printed = 0; st.progress = 0; st.benchFil = st.fil; st.pendingPrint = true;
+  if (st.nozzle > 200 && st.bed > 55){
+    st.pendingPrint = false; st.phase = 'printing'; st.t = 0; st.progress = 0;
+    ui.flash('¡Imprimiendo el Benchy!', 1600);
+  } else {
+    st.phase = 'heating';
+    ui.flash('Primero calienta: 210 °C / 60 °C', 1800);
+  }
+  startLoop(st, ui);
+};
+const removeBenchy = (st, ui) => {
+  if (st.phase === 'printing' || st.phase === 'heating') return ui.flash('Espera a que acabe');
+  if (!st.benchy) return ui.flash('La cama ya está vacía');
+  st.benchy = false; st.printed = 0; st.progress = 0; st.phase = 'cooling';
+  ui.flash('Pieza retirada · enfriando', 1800);
+  startLoop(st, ui);
+};
+const cycleFil = (st, ui) => {
+  if (st.phase === 'printing' || st.phase === 'heating') return ui.flash('No cambies el filamento ahora');
+  st.fil = (st.fil + 1) % FILS.length;
+  ui.flash(FILS[st.fil].name + ' PLA cargado', 1500);
+};
+
+const ui = mountFigure({
+  fig:'04', title:'Impresora 3D', turn:'full',
+  hint:'Precalienta y pulsa Imprimir Benchy (espacio) · clic en la bobina para cambiar de color · arrastra para girar',
+  palette:'cobalt',
+  size:[50,48,72], center:[23,23],
+  state:{ phase:'ready', nozzle:22, bed:22, printed:0, progress:0,
+          benchy:false, fil:0, benchFil:0, pendingPrint:false, t:0 },
+  scene,
+  readout: st => {
+    const p = Math.round((st.progress || 0)*100);
+    if (st.phase === 'printing') return `IMPRIMIENDO BENCHY · CAPA ${Math.min(31, Math.ceil((st.printed || 0)/LAYER))} · ${p}%`;
+    if (st.phase === 'heating') return 'CALENTANDO…';
+    if (st.phase === 'done') return 'BENCHY TERMINADO · RETÍRALO DE LA CAMA';
+    if (st.phase === 'cooling') return 'ENFRIANDO…';
+    return 'LISTO · PRECALIENTA Y PULSA IMPRIMIR BENCHY';
+  },
+  stats: st => [
+    { label:'BOQUILLA', value:`${Math.round(st.nozzle)}°C` },
+    { label:'CAMA', value:`${Math.round(st.bed)}°C` },
+    { label:'PIEZA', value:`${Math.round((st.progress || 0)*100)}%` },
+  ],
+  buttons:[
+    { label:'Precalentar', onClick: preheat },
+    { label:'Imprimir Benchy', onClick: printBenchy },
+    { label:'Quitar Benchy', onClick: removeBenchy },
+    { label:'Filamento', choices: st => FILS.map((f,i) => ({
+        label:f.name, current: st.fil === i,
+        disabled: st.phase === 'printing' || st.phase === 'heating',
+        why:'Espera a que acabe la impresión',
+        onClick:(st, ui) => { st.fil = i; ui.flash(f.name + ' PLA cargado', 1500); },
+      })) },
+  ],
+  acts:{
+    spool:(st, el, ui) => cycleFil(st, ui),
+    benchy:(st, el, ui) => {
+      if (st.phase === 'done') removeBenchy(st, ui);
+      else if (st.phase === 'printing') ui.flash('Todavía se está imprimiendo');
+    },
+  },
+  params:(st, q) => {
+    if (q.has('fil')) st.fil = clamp(+(q.get('fil') || 0), 0, FILS.length-1);
+    if (q.has('printed')){
+      st.printed = clamp(+(q.get('printed') || 0), 0, BENCHY_H);
+      st.phase = 'printing'; st.progress = st.printed/BENCHY_H;
+      st.benchy = true; st.benchFil = st.fil; st.nozzle = 210; st.bed = 60;
+    }
+    if (q.has('done')){
+      st.benchy = true; st.benchFil = st.fil; st.printed = BENCHY_H;
+      st.progress = 1; st.phase = 'done'; st.nozzle = 210; st.bed = 60;
+    }
+  },
+  idea:'Una impresora 3D es un robot que dibuja un objeto sólido capa a capa: la cama se desliza, el cabezal se mueve y el pórtico sube una capa cada vez.',
+});
+xrMount(() => ui, st => st.phase === 'printing'
+  ? 'Carcasa en fantasma mientras imprime: el filamento baja de la bobina, el extrusor lo empuja por el tubo PTFE hasta el hotend, y la cama se desliza bajo la boquilla capa a capa.'
+  : 'Carcasa en fantasma: sigue el filamento desde la bobina hasta la boquilla y mira las tripas: fuente, placa base, motores, correas, husillo y el hotend que funde el PLA.');
+/* interfaz en español (los controles compartidos vienen en inglés) */
+(() => {
+  const T = { 'Hand-drawn wobble':'Trazo a mano', 'Colour':'Color', 'View':'Vista', 'Labels':'Etiquetas' };
+  document.querySelectorAll('.ctl > label').forEach(l => { const t = T[l.textContent.trim()]; if (t) l.textContent = t; });
+  const byId = id => document.getElementById(id);
+  if (byId('vreset')) byId('vreset').textContent = 'Vista frontal';
+  if (byId('vspin')) byId('vspin').textContent = 'Girar';
+  if (byId('xrb')) byId('xrb').textContent = 'Rayos X';
+  if (byId('lblb')) byId('lblb').textContent = 'Etiquetas';
+  const credit = document.querySelector('.made-with a');
+  if (credit) credit.textContent = 'Hecho con Colorfigures ↗';
+})();
+addEventListener('keydown', e => {
+  if (/input|textarea/i.test(e.target.tagName)) return;
+  if (e.code === 'Space'){
+    if (e.target && e.target.closest && e.target.closest('button')) return;
+    e.preventDefault();
+    (ui.st.phase === 'done' ? removeBenchy : printBenchy)(ui.st, ui);
+  } else if (e.key === 'p' || e.key === 'P') preheat(ui.st, ui);
+  else if (e.key === 'r' || e.key === 'R') removeBenchy(ui.st, ui);
+});
+
+
+</script>
+</body></html>
